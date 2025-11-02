@@ -1,72 +1,84 @@
+#include <opencv2/opencv.hpp>
+#include <string>
+#include <cmath>
 #include <fcntl.h>
-#include <unistd.h>
-#include <stdint.h>
+#include <linux/fb.h>
 #include <sys/ioctl.h>
-#include <linux/spi/spidev.h>
-#include <string.h>
-#include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <chrono>
+#include <cstring>
 
-#define PIN_DC  25   // GPIO25 → DC
-#define PIN_RST 24   // GPIO24 → RST
+// (Pusula fonksiyonlarını olduğu gibi tutuyoruz; sadece çağrıyı yorumlayacağız)
 
-static void gpio_write(const char* p,const char* v){int f=open(p,O_WRONLY); if(f>=0){write(f,v,strlen(v)); close(f);} }
-static void gpio_export(int pin){ char p[64]; snprintf(p,64,"/sys/class/gpio/gpio%d",pin);
-  if(access(p,F_OK)!=0){ int f=open("/sys/class/gpio/export",O_WRONLY); char b[8]; sprintf(b,"%d",pin); write(f,b,strlen(b)); close(f); usleep(20000);}
-  snprintf(p,64,"/sys/class/gpio/gpio%d/direction",pin); gpio_write(p,"out"); }
-static void gpio_set(int pin,int v){ char p[64]; snprintf(p,64,"/sys/class/gpio/gpio%d/value",pin); gpio_write(p, v?"1":"0"); }
-
-static void spi_tx(int fd,const uint8_t* d,size_t n){ write(fd,d,n); }
-static void cmd(int fd,uint8_t c){ gpio_set(PIN_DC,0); spi_tx(fd,&c,1); }
-static void data1(int fd,uint8_t d){ gpio_set(PIN_DC,1); spi_tx(fd,&d,1); }
-static void dataN(int fd,const uint8_t* d,size_t n){ gpio_set(PIN_DC,1); spi_tx(fd,d,n); }
-
-static void set_window(int fd, uint8_t x0,uint8_t y0,uint8_t x1,uint8_t y1){
-  cmd(fd,0x15); uint8_t c[]={x0,x1}; dataN(fd,c,2);
-  cmd(fd,0x75); uint8_t r[]={y0,y1}; dataN(fd,r,2);
-  cmd(fd,0x5C);
+// RGB565 dönüşümü
+static inline uint16_t BGR2RGB565(uint8_t b, uint8_t g, uint8_t r) {
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-int main(){
-  // GPIO
-  gpio_export(PIN_DC); gpio_export(PIN_RST);
-  gpio_set(PIN_RST,0); usleep(20000);
-  gpio_set(PIN_RST,1); usleep(20000);
+int main() {
+    // --- Kamera: 128x128 native, BGR ---
+    cv::VideoCapture cap(
+        "libcamerasrc ! videoconvert ! "
+        "video/x-raw,width=128,height=128,format=BGR ! appsink",
+        cv::CAP_GSTREAMER);
+    if (!cap.isOpened()) return -1;
 
-  // SPI
-  int fd=open("/dev/spidev0.0",O_RDWR);
-  if(fd<0){perror("spidev"); return 1;}
-  uint8_t mode=SPI_MODE_0; uint32_t speed=16000000;
-  ioctl(fd,SPI_IOC_WR_MODE,&mode);
-  ioctl(fd,SPI_IOC_WR_MAX_SPEED_HZ,&speed);
+    // --- Framebuffer: OLED /dev/fb1 ---
+    int fb = open("/dev/fb1", O_RDWR);
+    if (fb < 0) { perror("fb1 açılamadı"); return -1; }
+    fb_var_screeninfo vinfo;
+    if (ioctl(fb, FBIOGET_VSCREENINFO, &vinfo) < 0) { perror("FBIOGET_VSCREENINFO"); return -1; }
+    size_t screensize = (size_t)vinfo.yres_virtual * (size_t)vinfo.xres_virtual * vinfo.bits_per_pixel / 8;
+    uint16_t* fbp = (uint16_t*)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+    if (fbp == MAP_FAILED) { perror("mmap başarısız"); return -1; }
 
-  // ---------- Waveshare SSD1351 init (128x128) ----------
-  cmd(fd,0xFD); data1(fd,0x12);        // Command Lock
-  cmd(fd,0xFD); data1(fd,0xB1);        // Command Lock (A2,B1 unlock)
-  cmd(fd,0xAE);                        // Display OFF
-  cmd(fd,0xB3); data1(fd,0xF1);        // Clock Div
-  cmd(fd,0xCA); data1(fd,0x7F);        // MUX = 127
-  cmd(fd,0xA0); data1(fd,0x74);        // Set Remap & Color Depth (RGB, 65k)
-  cmd(fd,0x15); data1(fd,0x00); data1(fd,0x7F); // Column
-  cmd(fd,0x75); data1(fd,0x00); data1(fd,0x7F); // Row
-  cmd(fd,0xA1); data1(fd,0x00);        // Start line
-  cmd(fd,0xA2); data1(fd,0x00);        // Display offset
-  cmd(fd,0xAB); data1(fd,0x01);        // Function select: external VDD
-  cmd(fd,0xB1); data1(fd,0x32);        // Precharge
-  cmd(fd,0xB4); uint8_t vsl[]={0xA0,0xB5,0x55}; dataN(fd,vsl,3); // Segment low voltages
-  cmd(fd,0xC1); uint8_t contrast[]={0xC8,0x80,0xC8}; dataN(fd,contrast,3);
-  cmd(fd,0xC7); data1(fd,0x0F);        // Master contrast
-  cmd(fd,0xB8); uint8_t gray[]={0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x10,0x11};
-  dataN(fd,gray,16); cmd(fd,0xB9);     // Use default gray table
-  cmd(fd,0xA6);                        // Normal display
-  cmd(fd,0xAF);                        // Display ON
-  usleep(20000);
+    // --- Gamma LUT (gamma = 0.45) ---
+    cv::Mat lut(1, 256, CV_8U);
+    for (int i = 0; i < 256; ++i) {
+        float n = i / 255.f;
+        float g = std::pow(n, 0.45f);
+        lut.at<uchar>(i) = (uchar)std::round(std::min(255.f, std::max(0.f, g * 255.f)));
+    }
 
-  // ---------- Full RED fill (RGB565 0xF800) ----------
-  set_window(fd,0,0,127,127);
-  const uint16_t RED = 0xF800;
-  uint8_t two[2]; two[0]=RED>>8; two[1]=RED&0xFF;
-  for(int i=0;i<128*128;i++) dataN(fd,two,2);
+    cv::Mat frame, gray, grayGamma, greenPhos;
+    // float heading = 0;  // pusula şimdilik devre dışı
 
-  close(fd);
-  return 0;
+    while (true) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        cap >> frame;
+        if (frame.empty()) break;              // 128x128 BGR
+
+        // NVG pipeline: gri → gamma LUT → fosfor
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        cv::LUT(gray, lut, grayGamma);
+        cv::applyColorMap(grayGamma, greenPhos, cv::COLORMAP_SUMMER);
+
+        // (Pusula kapalı)
+        // heading += -1;
+        // drawTopCompass(greenPhos, heading);
+
+        // OLED'e yaz (RGB565)
+        int maxY = std::min(greenPhos.rows, (int)vinfo.yres);
+        int maxX = std::min(greenPhos.cols, (int)vinfo.xres);
+        for (int y = 0; y < maxY; ++y) {
+            uint16_t* dst = fbp + y * vinfo.xres;
+            const cv::Vec3b* src = greenPhos.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < maxX; ++x) {
+                const cv::Vec3b& bgr = src[x];
+                dst[x] = BGR2RGB565(bgr[0], bgr[1], bgr[2]);
+            }
+        }
+
+        // ~60 FPS cap
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (ms < 16) usleep((16 - ms) * 1000);
+    }
+
+    if (fbp && fbp != MAP_FAILED) munmap(fbp, screensize);
+    if (fb >= 0) close(fb);
+    cap.release();
+    return 0;
 }
